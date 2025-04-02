@@ -1,0 +1,4 @@
+# requirements.txt for deployment script
+fabric>=3.0.0,<4.0.0
+invoke>=2.0.0,<3.0.0 # Fabric dependency, good to specify
+paramiko>=2.10.0,<4.0.0 # Fabric dependency

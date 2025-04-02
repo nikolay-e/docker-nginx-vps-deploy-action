@@ -1,0 +1,204 @@
+# action.yml in nikolay-e/docker-nginx-vps-deploy-action
+
+name: 'Docker Nginx VPS Deployer (Python)'
+description: 'Builds/pushes Docker image, deploys via SSH using Python/Fabric, configures Nginx with SSL.'
+author: 'nikolay-e'
+branding:
+  icon: 'terminal'
+  color: 'green'
+
+# --- Inputs ---
+inputs:
+  image-name:
+    description: "Base name for the Docker image (e.g., 'my-web-app'). No registry/username prefix."
+    required: true
+  docker-registry-username:
+    description: "Username for the Docker registry (e.g., Docker Hub username)."
+    required: true
+  docker-context:
+    description: "Path to the Docker build context directory."
+    required: false
+    default: "."
+  docker-file:
+    description: "Path to the Dockerfile, relative to docker-context."
+    required: false
+    default: "Dockerfile"
+  vps-host:
+    description: "Hostname or IP address of the target VPS."
+    required: true
+  vps-user:
+    description: "Username for SSH login to the VPS."
+    required: true
+  container-port:
+    description: "The port number the application listens on *inside* the container."
+    required: true
+  domain:
+    description: "The public domain name (e.g., 'app.example.com') for Nginx."
+    required: true
+  # Secrets (Documentation Only - Must be passed via `env` in workflow)
+  # DOCKER_REGISTRY_TOKEN: Token/password for Docker registry.
+  # VPS_SSH_PRIVATE_KEY: Private SSH key for VPS access (raw or Base64).
+  # SSL_CERT: SSL certificate content (raw or Base64).
+  # SSL_KEY: SSL private key content (raw or Base64).
+
+# --- Outputs ---
+outputs:
+  image-tag:
+    description: "The short git SHA tag used for the built image (e.g., 'a1b2c3d')."
+  image-url:
+    description: "The full URL of the pushed image, including the tag."
+  deployment-url:
+    description: "The final HTTPS URL where the application is expected to be available."
+
+# --- Action Steps ---
+runs:
+  using: "composite"
+  steps:
+    # --- Docker Build & Push Steps ---
+    - name: Setup Docker Buildx
+      id: setup-buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Login to Docker Registry
+      id: login-docker
+      uses: docker/login-action@v3
+      with:
+        username: ${{ inputs.docker-registry-username }}
+        password: ${{ env.DOCKER_REGISTRY_TOKEN }}
+
+    - name: Generate Docker Image Metadata
+      id: docker-metadata
+      shell: bash
+      run: |
+        IMAGE_TAG=${GITHUB_SHA::7}
+        FULL_IMAGE_URL="${{ inputs.docker-registry-username }}/${{ inputs.image-name }}:$IMAGE_TAG"
+        LATEST_TAG_ARG=""
+        if [[ "${{ github.ref }}" == "refs/heads/main" || "${{ github.ref }}" == "refs/heads/master" ]]; then
+          LATEST_IMAGE_URL="${{ inputs.docker-registry-username }}/${{ inputs.image-name }}:latest"
+          LATEST_TAG_ARG=$LATEST_IMAGE_URL
+        fi
+        echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+        echo "image_url=$FULL_IMAGE_URL" >> $GITHUB_OUTPUT
+        echo "latest_tag_argument=$LATEST_TAG_ARG" >> $GITHUB_OUTPUT
+        echo "deployment_url=https://${{ inputs.domain }}" >> $GITHUB_OUTPUT
+
+    - name: Build and Push Docker Image
+      id: build-push
+      uses: docker/build-push-action@v5
+      with:
+        context: ${{ inputs.docker-context }}
+        file: ${{ inputs.docker-file }}
+        push: true
+        tags: |
+          ${{ steps.docker-metadata.outputs.image_url }}
+          ${{ steps.docker-metadata.outputs.latest_tag_argument }}
+        cache-from: type=gha
+        cache-to: type=gha,mode=max
+
+    # --- Nginx Config Preparation ---
+    - name: Prepare Nginx Configuration (Base64)
+      id: prepare-nginx
+      shell: bash
+      run: |
+        echo "Generating Nginx config for domain '${{ inputs.domain }}'..."
+        # Define the Nginx configuration template
+        read -r -d '' NGINX_TEMPLATE << EOM || true
+        server {
+            listen 80;
+            server_name ${{ inputs.domain }} www.${{ inputs.domain }}; # Optional www.
+            location / { return 301 https://\$host\$request_uri; }
+        }
+
+        server {
+            listen 443 ssl http2;
+            server_name ${{ inputs.domain }} www.${{ inputs.domain }}; # Optional www.
+
+            # SSL Certificate files
+            ssl_certificate /etc/nginx/ssl/${{ inputs.domain }}.crt;
+            ssl_certificate_key /etc/nginx/ssl/${{ inputs.domain }}.key;
+
+            # --- Basic Secure SSL Settings (Included directly) ---
+            ssl_protocols TLSv1.2 TLSv1.3;
+            # Using Mozilla Intermediate cipher suite (recommended)
+            ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:DHE-RSA-AES128-GCM-SHA256:DHE-RSA-AES256-GCM-SHA384;
+            ssl_prefer_server_ciphers off;
+            # --- End Basic SSL Settings ---
+
+            # Optional: ssl_dhparam (generate on VPS if needed)
+            # ssl_dhparam /etc/nginx/ssl/dhparam.pem;
+
+            # Optional: Security Headers
+            # add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always; # Use preload only if sure
+            # add_header X-Frame-Options "SAMEORIGIN" always;
+            # add_header X-Content-Type-Options "nosniff" always;
+
+            location / {
+                proxy_pass http://127.0.0.1:${{ inputs.container-port }};
+                proxy_set_header Host \$host;
+                proxy_set_header X-Real-IP \$remote_addr;
+                proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+                proxy_set_header X-Forwarded-Proto \$scheme;
+                proxy_http_version 1.1;
+                proxy_set_header Upgrade \$http_upgrade;
+                proxy_set_header Connection \$http_connection;
+                proxy_cache_bypass \$http_upgrade;
+            }
+        }
+        EOM
+        # Base64 encode
+        NGINX_CONF_B64=$(echo "$NGINX_TEMPLATE" | base64 -w 0)
+        echo "Nginx config prepared and Base64 encoded."
+        echo "nginx_conf_base64=$NGINX_CONF_B64" >> $GITHUB_OUTPUT
+
+    # --- Python Deployment Steps ---
+    - name: Set up Python Environment
+      id: setup-python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.10'
+
+    - name: Install Python Dependencies
+      id: install-deps
+      shell: bash
+      run: |
+        pip install --upgrade pip
+        # Assuming requirements.txt and deploy_vps.py are in the root of the action repo
+        if [ -f "$GITHUB_ACTION_PATH/requirements.txt" ]; then
+          pip install -r "$GITHUB_ACTION_PATH/requirements.txt"
+        else
+          echo "requirements.txt not found in action directory."
+          # Optionally install Fabric directly if requirements.txt isn't found
+          # pip install fabric invoke paramiko
+        fi
+
+    - name: Execute Python Deployment Script
+      id: deploy-vps-python
+      shell: bash
+      env:
+        SECRET_VPS_SSH_PRIVATE_KEY: ${{ env.VPS_SSH_PRIVATE_KEY }}
+        SECRET_SSL_CERT: ${{ env.SSL_CERT }}
+        SECRET_SSL_KEY: ${{ env.SSL_KEY }}
+        VAR_NGINX_CONF_B64: ${{ steps.prepare-nginx.outputs.nginx_conf_base64 }}
+      run: |
+        # Ensure the python script exists before running
+        if [ ! -f "$GITHUB_ACTION_PATH/deploy_vps.py" ]; then
+           echo "Error: deploy_vps.py not found in action directory ($GITHUB_ACTION_PATH)."
+           exit 1
+        fi
+        python "$GITHUB_ACTION_PATH/deploy_vps.py" \
+          --host "${{ inputs.vps-host }}" \
+          --user "${{ inputs.vps-user }}" \
+          --image-url "${{ steps.docker-metadata.outputs.image_url }}" \
+          --image-name "${{ inputs.image-name }}" \
+          --container-port "${{ inputs.container-port }}" \
+          --domain "${{ inputs.domain }}"
+
+    # --- Finalize Outputs ---
+    - name: Finalize Action Outputs
+      id: finalize-outputs
+      shell: bash
+      run: |
+        echo "Action completed. Setting final outputs."
+        echo "image-tag=${{ steps.docker-metadata.outputs.image_tag }}" >> $GITHUB_OUTPUT
+        echo "image-url=${{ steps.docker-metadata.outputs.image_url }}" >> $GITHUB_OUTPUT
+        echo "deployment-url=${{ steps.docker-metadata.outputs.deployment_url }}" >> $GITHUB_OUTPUT
