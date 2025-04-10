@@ -5,3 +5,5 @@
 # OS generated files
 .DS_Store
 Thumbs.db
+
+directory_tree.yaml
