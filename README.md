@@ -2,7 +2,6 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![GitHub release (latest SemVer)](https://img.shields.io/github/v/release/nikolay-e/docker-nginx-vps-deploy-action)](https://github.com/nikolay-e/docker-nginx-vps-deploy-action/releases)
-[![GitHub Action Status](https://github.com/nikolay-e/docker-nginx-vps-deploy-action/actions/workflows/main.yml/badge.svg)](https://github.com/nikolay-e/docker-nginx-vps-deploy-action/actions/workflows/main.yml)
 
 This GitHub Action automates the process of:
 1.  Building a Docker image from your repository.
