@@ -1,7 +1,7 @@
 import base64
 import logging
 import re
-from typing import Optional
+from typing import Optional, Dict
 
 log = logging.getLogger(__name__)
 
@@ -36,5 +36,24 @@ def decode_if_base64(value: Optional[str]) -> Optional[str]:
     # If not Base64 or if it looked like PEM, return original
     return value
 
-# Note: write_temp_key_file was integrated into SSHRunner for simplicity
-# If needed elsewhere, it could reside here.
+def mask_secrets(text, secrets_dict):
+    """
+    Masks secret values in text to prevent logging exposure.
+    
+    Args:
+        text (str): The text that might contain secrets
+        secrets_dict (dict): Dictionary of secrets to mask
+        
+    Returns:
+        str: Text with secrets replaced by "***MASKED***"
+    """
+    if not text or not isinstance(text, str):
+        return text
+        
+    masked_text = text
+    for secret_name, secret_value in secrets_dict.items():
+        if secret_value and isinstance(secret_value, str) and len(secret_value) > 5:
+            # Only mask non-empty strings that are reasonably long
+            masked_text = masked_text.replace(secret_value, "***MASKED***")
+    
+    return masked_text

@@ -7,31 +7,61 @@ import time
 from typing import Optional, Dict
 
 # Local imports
-from ssh_runner import SSHRunner # Assuming ssh_runner.py is in the same directory
-from deployer import VpsDeployer # Assuming deployer.py is in the same directory
+from ssh_runner import SSHRunner
+from deployer import VpsDeployer
+from utils import mask_secrets
 
-# --- Logging Setup --- (Copied from original deploy_vps.py)
-SUCCESS_LEVEL_NUM = 25
-logging.addLevelName(SUCCESS_LEVEL_NUM, "SUCCESS")
-def success(self, message, *args, **kws):
-    if self.isEnabledFor(SUCCESS_LEVEL_NUM):
-        self._log(SUCCESS_LEVEL_NUM, message, args, **kws)
-logging.Logger.success = success
+# --- Custom Logging Filter ---
+class SecretFilter(logging.Filter):
+    """Filter to remove secrets from log messages"""
+    
+    def __init__(self, secrets):
+        super().__init__()
+        self.secrets = secrets
+        
+    def filter(self, record):
+        if hasattr(record, 'msg') and isinstance(record.msg, str):
+            record.msg = mask_secrets(record.msg, self.secrets)
+        
+        if hasattr(record, 'args'):
+            # Handle string formatting arguments
+            args = list(record.args)
+            for i, arg in enumerate(args):
+                if isinstance(arg, str):
+                    args[i] = mask_secrets(arg, self.secrets)
+            record.args = tuple(args)
+        return True
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='[%(asctime)s] [%(levelname)-7s] [%(module)-10s] %(message)s', # Added module name
-    datefmt='%Y-%m-%d %H:%M:%S'
-)
-log = logging.getLogger(__name__)
-# if os.environ.get('ACTIONS_STEP_DEBUG') == 'true':
-#     logging.getLogger().setLevel(logging.DEBUG) # Set root logger level
+# --- Logging Setup ---
+def setup_logging(secrets):
+    """Set up logging with secret filtering"""
+    SUCCESS_LEVEL_NUM = 25
+    logging.addLevelName(SUCCESS_LEVEL_NUM, "SUCCESS")
+    
+    def success(self, message, *args, **kws):
+        if self.isEnabledFor(SUCCESS_LEVEL_NUM):
+            self._log(SUCCESS_LEVEL_NUM, message, args, **kws)
+    
+    logging.Logger.success = success
+    
+    logging.basicConfig(
+        level=logging.INFO,
+        format='[%(asctime)s] [%(levelname)-7s] [%(module)-10s] %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    
+    # Add our secret filter to all handlers
+    root_logger = logging.getLogger()
+    secret_filter = SecretFilter(secrets)
+    for handler in root_logger.handlers:
+        handler.addFilter(secret_filter)
+    
+    return logging.getLogger(__name__)
 
 # --- Main Execution Logic ---
 def main():
     start_time = time.time()
-    log.info("--- Python Deployment Script Started ---")
-
+    
     parser = argparse.ArgumentParser(description="Deploy Docker container to VPS with optional Nginx setup.")
     # Add arguments matching action inputs
     parser.add_argument("--host", required=True, help="VPS hostname or IP address.")
@@ -46,20 +76,28 @@ def main():
     parser.add_argument("--docker-prune-filter", required=True, help="Filter for 'docker image prune -af'.")
     args = parser.parse_args()
 
-    log.info("Deployment Settings:")
-    log.info(f"  Host: {args.user}@{args.host}")
-    log.info(f"  Image URL: {args.image_url}")
-    # ... log other args similarly ...
-    log.info(f"  Skip Nginx: {args.nginx_skip}")
-    log.info(f"  Skip SSL: {args.ssl_skip}")
-
-    # Read secrets from environment
+    # Read secrets from environment - do this before setting up logging
     secrets = {
         "SECRET_VPS_SSH_PRIVATE_KEY": os.environ.get("SECRET_VPS_SSH_PRIVATE_KEY"),
         "SECRET_SSL_CERT": os.environ.get("SECRET_SSL_CERT"),
         "SECRET_SSL_KEY": os.environ.get("SECRET_SSL_KEY"),
         "VAR_NGINX_CONF_B64": os.environ.get("VAR_NGINX_CONF_B64"),
     }
+    
+    # Set up logging with secret filtering
+    log = setup_logging(secrets)
+    
+    log.info("--- Python Deployment Script Started ---")
+    log.info("Deployment Settings:")
+    log.info(f"  Host: {args.user}@{args.host}")
+    log.info(f"  Image URL: {args.image_url}")
+    log.info(f"  Image Name: {args.image_name}")
+    log.info(f"  Container Port: {args.container_port}")
+    log.info(f"  Container Internal Port: {args.container_internal_port}")
+    log.info(f"  Domain: {args.domain}")
+    log.info(f"  Skip Nginx: {args.nginx_skip}")
+    log.info(f"  Skip SSL: {args.ssl_skip}")
+    log.info(f"  Docker prune filter: {args.docker_prune_filter}")
 
     runner: Optional[SSHRunner] = None
     exit_code = 0
@@ -68,7 +106,8 @@ def main():
         runner = SSHRunner(
             host=args.host,
             user=args.user,
-            ssh_key_secret=secrets.get("SECRET_VPS_SSH_PRIVATE_KEY")
+            ssh_key_secret=secrets.get("SECRET_VPS_SSH_PRIVATE_KEY"),
+            secrets_dict=secrets  # Pass secrets for masking
         )
 
         # 2. Initialize Deployer with the runner

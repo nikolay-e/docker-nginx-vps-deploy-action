@@ -8,11 +8,12 @@ from io import StringIO
 from typing import Optional, Dict
 
 # Local imports
-from ssh_runner import SSHRunner # Assuming ssh_runner.py is in the same directory
+from ssh_runner import SSHRunner
+from utils import decode_if_base64, mask_secrets
 
 log = logging.getLogger(__name__)
 
-# --- Constants --- (Copied from original deploy_vps.py)
+# --- Constants ---
 REQUIRED_CORE_COMMANDS = ["docker", "systemctl", "mkdir", "chmod", "chown", "mv", "rm", "ln", "tee", "command", "whoami"]
 NGINX_COMMANDS = ["nginx"] # Only needed if Nginx isn't skipped
 
@@ -93,15 +94,20 @@ class VpsDeployer:
         log.info(f"Directories checked/created: {dirs_str}")
 
 
-    def _upload_content(self, content: str, remote_path: str, owner: str = "root", group: str = "root", mode: str = "644"):
+    def _upload_content(self, content: str, remote_path: str, owner: str = "root", 
+                        group: str = "root", mode: str = "644", sensitive: bool = False):
         """Uploads string content via SSHRunner."""
         remote_dir = os.path.dirname(remote_path)
         remote_filename = os.path.basename(remote_path)
         remote_tmp_path = f"/tmp/{remote_filename}.{int(time.time())}.tmp"
 
-        log.info(f"Uploading content to {remote_path} (via {remote_tmp_path}) mode={mode} owner={owner}:{group}")
+        if sensitive:
+            log.info(f"Uploading sensitive content to {remote_path} (via temp file) mode={mode} owner={owner}:{group}")
+        else:
+            log.info(f"Uploading content to {remote_path} (via {remote_tmp_path}) mode={mode} owner={owner}:{group}")
+            
         try:
-            self.runner.put(StringIO(content), remote_tmp_path)
+            self.runner.put(StringIO(content), remote_tmp_path, sensitive=sensitive)
             self.runner.sudo(f"mkdir -p {remote_dir}", error_msg_prefix=f"Failed ensure dir {remote_dir}")
             self.runner.sudo(f"mv {remote_tmp_path} {remote_path}", error_msg_prefix="Failed to move file")
             self.runner.sudo(f"chown {owner}:{group} {remote_path}", error_msg_prefix="Failed to set owner")
@@ -124,15 +130,15 @@ class VpsDeployer:
         key_content = self.secrets.get("SECRET_SSL_KEY")
         if not cert_content or not key_content:
             raise ValueError("SSL Cert or Key secret is missing.")
-        # Assuming decode_if_base64 is imported from utils or defined globally
-        from utils import decode_if_base64
+            
         final_cert = decode_if_base64(cert_content)
         final_key = decode_if_base64(key_content)
         if not final_cert or not final_key:
             raise ValueError("SSL Cert or Key content is empty after decode.")
 
-        self._upload_content(final_cert, cert_path, mode="644")
-        self._upload_content(final_key, key_path, mode="600") # Secure key
+        # Use _upload_content with sensitivity flag
+        self._upload_content(final_cert, cert_path, mode="644", sensitive=True)
+        self._upload_content(final_key, key_path, mode="600", sensitive=True)
         log.success("SSL certificate and key deployed.")
 
 
@@ -150,9 +156,10 @@ class VpsDeployer:
         conf_available_path = f"/etc/nginx/sites-available/{self.args.domain}.conf"
         conf_enabled_path = f"/etc/nginx/sites-enabled/{self.args.domain}.conf"
 
-        self._upload_content(conf_content, conf_available_path, mode="644")
+        # Use sensitive=True since config might contain secrets
+        self._upload_content(conf_content, conf_available_path, mode="644", sensitive=True)
         self.runner.sudo(f"ln -sf {conf_available_path} {conf_enabled_path}",
-                         error_msg_prefix="Failed to enable Nginx site (symlink)")
+                       error_msg_prefix="Failed to enable Nginx site (symlink)")
         log.success("Nginx configuration deployed and enabled.")
 
 
@@ -162,7 +169,7 @@ class VpsDeployer:
         log.info(f"Starting Docker deployment: {self.args.image_url} -> {container_name}")
 
         self.runner.run(f"docker pull {self.args.image_url}", hide=False, pty=False,
-                        error_msg_prefix="Failed to pull Docker image")
+                      error_msg_prefix="Failed to pull Docker image")
 
         log.info(f"Stopping/removing old container '{container_name}'...")
         self.runner.run(f"docker stop {container_name}", warn=True, hide=True)
@@ -178,14 +185,14 @@ class VpsDeployer:
             f"{self.args.image_url}"
         )
         result = self.runner.run(run_cmd, capture=True, hide=True,
-                                 error_msg_prefix="Failed to start Docker container")
+                               error_msg_prefix="Failed to start Docker container")
 
         if result and result.stdout:
              container_id = result.stdout.strip()[:12]
              log.success(f"Container '{container_name}' started. ID: {container_id}")
              time.sleep(3)
              status_result = self.runner.run(f"docker ps -f id={container_id} --format '{{{{.Status}}}}'",
-                                             capture=True, hide=True, warn=True)
+                                           capture=True, hide=True, warn=True)
              if status_result and status_result.stdout and "Up" in status_result.stdout:
                   log.info(f"Container confirmed running.")
              else:
@@ -202,11 +209,11 @@ class VpsDeployer:
         """Validates Nginx config and reloads service."""
         log.info("Validating Nginx configuration...")
         result = self.runner.sudo("nginx -t", hide=True, warn=True, pty=False, capture=True,
-                                  error_msg_prefix="Nginx syntax check command failed")
+                                error_msg_prefix="Nginx syntax check command failed")
         if result and result.ok and "test is successful" in result.stderr:
             log.info("Nginx config test successful.")
             self.runner.sudo("systemctl reload nginx",
-                             error_msg_prefix="Failed to reload Nginx service")
+                           error_msg_prefix="Failed to reload Nginx service")
             log.success("Nginx reloaded successfully.")
         elif result:
             log.critical("Nginx configuration test FAILED!")
@@ -221,5 +228,5 @@ class VpsDeployer:
         log.info(f"Cleaning up Docker images (filter: '{prune_filter}')...")
         cmd = f"docker image prune -af --filter \"{prune_filter}\""
         self.runner.run(cmd, hide=True, warn=True, # Non-critical
-                        error_msg_prefix="Docker image prune failed")
+                      error_msg_prefix="Docker image prune failed")
         log.info("Docker image cleanup command executed.")

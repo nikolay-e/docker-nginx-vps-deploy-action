@@ -10,20 +10,21 @@ from invoke import UnexpectedExit
 from paramiko.ssh_exception import AuthenticationException, SSHException
 
 # Local imports
-from utils import decode_if_base64 # Assuming utils.py is in the same directory
+from utils import decode_if_base64, mask_secrets
 
 log = logging.getLogger(__name__)
 
 class SSHRunner:
     """Handles SSH connection, key management, and command execution."""
 
-    def __init__(self, host: str, user: str, ssh_key_secret: Optional[str], connect_timeout: int = 30):
+    def __init__(self, host: str, user: str, ssh_key_secret: Optional[str], connect_timeout: int = 30, secrets_dict=None):
         self.host = host
         self.user = user
         self._ssh_key_secret = ssh_key_secret
         self._connect_timeout = connect_timeout
         self.connection: Optional[Connection] = None
         self.temp_key_path: Optional[str] = None
+        self.secrets_dict = secrets_dict or {}  # Store secrets for masking
 
         self._setup_key()
         self._connect()
@@ -96,17 +97,23 @@ class SSHRunner:
         """Runs a command using connection.sudo with enhanced logging/error handling."""
         return self._run_remote_cmd(command, sudo=True, **kwargs)
 
-    def put(self, local_file_obj, remote_path):
+    def put(self, local_file_obj, remote_path, sensitive=False):
          """Uploads a file-like object."""
          if not self.connection: raise RuntimeError("SSH connection lost")
          try:
-              log.debug(f"Uploading file object to {remote_path}")
+              if sensitive:
+                  log.debug(f"Uploading sensitive file to {remote_path}")
+              else:
+                  log.debug(f"Uploading file object to {remote_path}")
               return self.connection.put(local_file_obj, remote_path)
          except (IOError, OSError, SSHException) as e:
               log.error(f"Failed to upload file object to {remote_path}: {e}")
               raise IOError(f"Failed to upload file object to {remote_path}") from e
 
-    def _run_remote_cmd(self, command: str, sudo: bool = False, hide: bool = True, warn: bool = False, pty: bool = False, capture: bool = False, error_msg_prefix: str = "Command failed") -> Optional[Result]:
+    def _run_remote_cmd(self, command: str, sudo: bool = False, hide: bool = True, 
+                      warn: bool = False, pty: bool = False, capture: bool = False, 
+                      error_msg_prefix: str = "Command failed",
+                      sensitive: bool = False) -> Optional[Result]:
         """Internal helper to run commands, handle exceptions and logging."""
         if not self.connection or not self.connection.is_connected:
              log.critical("SSH connection lost or not established.")
@@ -114,42 +121,87 @@ class SSHRunner:
 
         runner = self.connection.sudo if sudo else self.connection.run
         action = "sudo" if sudo else "run"
-        log.debug(f"Executing ({action}): {command}")
+        
+        # Don't log sensitive commands in full
+        if sensitive:
+            log.debug(f"Executing sensitive {action} command (details hidden)")
+        else:
+            log.debug(f"Executing ({action}): {command}")
 
         try:
-            result = runner(command, hide=hide, warn=True, pty=pty) # Use warn=True always
+            result = runner(command, hide=hide, warn=True, pty=pty)
 
             if result.ok:
-                log.debug(f"Command successful (exit code {result.exited}): {command}")
+                if not sensitive:
+                    log.debug(f"Command successful (exit code {result.exited}): {command}")
+                else:
+                    log.debug(f"Sensitive command successful (exit code {result.exited})")
+                    
                 if not hide or log.isEnabledFor(logging.DEBUG):
-                     if result.stdout: log.debug(f"STDOUT:\n{result.stdout.strip()}")
-                     if result.stderr: log.debug(f"STDERR:\n{result.stderr.strip()}")
-                return result if capture else None # Return Result only if capture=True
+                    # Be careful with logging output - it might contain secrets
+                    if sensitive:
+                        log.debug("Output of sensitive command hidden")
+                    else:
+                        # Apply masking to output if we have secrets
+                        if result.stdout:
+                            stdout = result.stdout.strip()
+                            if self.secrets_dict:
+                                stdout = mask_secrets(stdout, self.secrets_dict)
+                            log.debug(f"STDOUT:\n{stdout}")
+                            
+                        if result.stderr:
+                            stderr = result.stderr.strip()
+                            if self.secrets_dict:
+                                stderr = mask_secrets(stderr, self.secrets_dict)
+                            log.debug(f"STDERR:\n{stderr}")
+                
+                return result if capture else None
             else:
                 # Command failed
                 log_func = log.warning if warn else log.error
-                log_func(f"{error_msg_prefix}: '{command}' exited with code {result.exited}.")
-                # Always log output on failure
-                if result.stdout: log_func(f"Failed command STDOUT:\n{result.stdout.strip()}")
-                if result.stderr: log_func(f"Failed command STDERR:\n{result.stderr.strip()}")
+                
+                if sensitive:
+                    log_func(f"{error_msg_prefix}: Sensitive command exited with code {result.exited}")
+                    # Don't log output of sensitive commands even on failure
+                else:
+                    log_func(f"{error_msg_prefix}: '{command}' exited with code {result.exited}")
+                    # Always log output on failure for non-sensitive commands
+                    if result.stdout:
+                        stdout = result.stdout.strip()
+                        if self.secrets_dict:
+                            stdout = mask_secrets(stdout, self.secrets_dict)
+                        log_func(f"Failed command STDOUT:\n{stdout}")
+                        
+                    if result.stderr:
+                        stderr = result.stderr.strip()
+                        if self.secrets_dict:
+                            stderr = mask_secrets(stderr, self.secrets_dict)
+                        log_func(f"Failed command STDERR:\n{stderr}")
 
-                # Add hints
-                stderr_lower = result.stderr.lower()
-                if "command not found" in stderr_lower: log_func("Hint: Ensure command is installed and in PATH.")
-                elif "permission denied" in stderr_lower: log_func(f"Hint: Check permissions for '{self.user}' or required sudo.")
-                elif "no such file" in stderr_lower: log_func("Hint: Check file/directory path.")
+                    # Add hints
+                    stderr_lower = result.stderr.lower() if result.stderr else ""
+                    if "command not found" in stderr_lower: 
+                        log_func("Hint: Ensure command is installed and in PATH.")
+                    elif "permission denied" in stderr_lower: 
+                        log_func(f"Hint: Check permissions for '{self.user}' or required sudo.")
+                    elif "no such file" in stderr_lower: 
+                        log_func("Hint: Check file/directory path.")
 
                 if not warn:
                     raise RuntimeError(f"{error_msg_prefix}: Command exited with code {result.exited}")
-                return None # Return None on failure if warn=True
+                return None
 
-        except Exception as e: # Catch other unexpected errors
+        except Exception as e:
             log_func = log.warning if warn else log.critical
-            log_func(f"Exception executing command: {command}", exc_info=True)
+            
+            if sensitive:
+                log_func("Exception executing sensitive command")
+            else:
+                log_func(f"Exception executing command: {command}")
+                
             if not warn:
-                raise RuntimeError(f"Exception during command execution") from e
+                raise RuntimeError("Exception during command execution") from e
             return None
-
 
     def close(self):
         """Closes SSH connection and removes temporary key file."""

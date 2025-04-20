@@ -147,8 +147,12 @@ runs:
         NGINX_CONF_B64=$(base64 -w 0 < "$RENDERED_FILE")
         rm "$RENDERED_FILE"
         echo "Nginx config prepared and Base64 encoded."
-        echo "nginx_conf_base64=$NGINX_CONF_B64" >> $GITHUB_OUTPUT
-        # Note: The $NGINX_CONF_B64 value will appear in the env context log below, this is expected.
+        # Use multiline output format to avoid exposing secrets in logs
+        {
+          echo "nginx_conf_base64<<EOF" >> $GITHUB_OUTPUT
+          echo "$NGINX_CONF_B64" >> $GITHUB_OUTPUT 
+          echo "EOF" >> $GITHUB_OUTPUT
+        }
 
     # --- Python Deployment Steps ---
     - name: Set up Python Environment
